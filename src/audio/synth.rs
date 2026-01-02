@@ -13,19 +13,6 @@ use crate::core::{
     PiperModel, PiperResult,
 };
 
-#[allow(dead_code)]
-pub fn param_to_percent(value: f32, min: f32, max: f32) -> u8 {
-    ((value - min) / (max - min) * 100.0f32).round() as u8
-}
-
-pub fn percent_to_param(value: u8, min: f32, max: f32) -> f32 {
-    (value as f32 / 100.0f32) * (max - min) + min
-}
-
-const RATE_RANGE: (f32, f32) = (0.5f32, 5.5f32);
-const VOLUME_RANGE: (f32, f32) = (0.0f32, 1.0f32);
-const PITCH_RANGE: (f32, f32) = (0.5f32, 1.5f32);
-
 pub static SYNTHESIS_THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
     let num_cpus = std::thread::available_parallelism()
         .map(usize::from)
@@ -39,9 +26,9 @@ pub static SYNTHESIS_THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
 
 #[derive(Clone)]
 pub struct AudioOutputConfig {
-    pub rate: Option<u8>,
-    pub volume: Option<u8>,
-    pub pitch: Option<u8>,
+    pub rate: Option<f32>,
+    pub volume: Option<f32>,
+    pub pitch: Option<f32>,
     pub appended_silence_ms: Option<u32>,
 }
 
@@ -79,22 +66,13 @@ impl AudioOutputConfig {
         unsafe {
             let stream = sonic_rs_sys::sonicCreateStream(sample_rate as i32, num_channels as i32);
             if let Some(rate) = self.rate {
-                sonic_rs_sys::sonicSetSpeed(
-                    stream,
-                    percent_to_param(rate, RATE_RANGE.0, RATE_RANGE.1),
-                );
+                sonic_rs_sys::sonicSetSpeed(stream, rate);
             }
             if let Some(volume) = self.volume {
-                sonic_rs_sys::sonicSetVolume(
-                    stream,
-                    percent_to_param(volume, VOLUME_RANGE.0, VOLUME_RANGE.1),
-                );
+                sonic_rs_sys::sonicSetVolume(stream, volume);
             }
             if let Some(pitch) = self.pitch {
-                sonic_rs_sys::sonicSetPitch(
-                    stream,
-                    percent_to_param(pitch, PITCH_RANGE.0, PITCH_RANGE.1),
-                );
+                sonic_rs_sys::sonicSetPitch(stream, pitch);
             }
             sonic_rs_sys::sonicWriteFloatToStream(stream, samples.as_ptr(), input_len as i32);
             sonic_rs_sys::sonicFlushStream(stream);
@@ -169,7 +147,7 @@ impl PiperSpeechSynthesizer {
         chunk_padding: usize,
     ) -> PiperResult<RealtimeSpeechStream> {
         let provider = self.create_synthesis_task_provider(text, output_config);
-        let wavinfo = self.0.audio_output_info()?;
+        let wavinfo = self.0.audio_output_info();
         RealtimeSpeechStream::new(
             provider,
             chunk_size,
@@ -203,9 +181,9 @@ impl PiperSpeechSynthesizer {
         Ok(audio::write_wave_samples_to_file(
             filename,
             audio.to_i16_vec().iter(),
-            self.0.audio_output_info()?.sample_rate as u32,
-            self.0.audio_output_info()?.num_channels.try_into().unwrap(),
-            self.0.audio_output_info()?.sample_width.try_into().unwrap(),
+            self.0.audio_output_info().sample_rate as u32,
+            self.0.audio_output_info().num_channels.try_into().unwrap(),
+            self.0.audio_output_info().sample_width.try_into().unwrap(),
         )?)
     }
     #[inline(always)]
@@ -215,7 +193,7 @@ impl PiperSpeechSynthesizer {
 }
 
 impl PiperModel for PiperSpeechSynthesizer {
-    fn audio_output_info(&self) -> PiperResult<AudioInfo> {
+    fn audio_output_info(&self) -> AudioInfo {
         self.0.audio_output_info()
     }
     fn phonemize_text(&self, text: &str) -> PiperResult<Phonemes> {

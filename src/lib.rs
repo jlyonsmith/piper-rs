@@ -8,7 +8,7 @@ use serde::Deserialize;
 mod audio;
 mod core;
 pub use audio::synth;
-use core::{Audio, AudioInfo, AudioSamples, AudioStreamIterator, Phonemes, PiperModel};
+pub use core::{Audio, AudioInfo, AudioSamples, AudioStreamIterator, Phonemes, PiperModel};
 pub use core::{PiperAudioResult, PiperError, PiperResult};
 
 use std::any::Any;
@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const MIN_CHUNK_SIZE: isize = 44;
 const MAX_CHUNK_SIZE: usize = 1024;
@@ -74,7 +74,7 @@ fn create_inference_session(model_path: &Path) -> Result<Session, ort::Error> {
 
 pub fn from_config_path(config_path: &Path) -> PiperResult<Arc<dyn PiperModel + Send + Sync>> {
     let (config, synth_config) = load_model_config(config_path)?;
-    if config.streaming.unwrap_or_default() {
+    if config.streaming {
         Ok(Arc::new(VitsStreamingModel::from_config(
             config,
             synth_config,
@@ -104,27 +104,23 @@ pub struct AudioConfig {
 
 #[derive(Deserialize, Default)]
 pub struct ESpeakConfig {
-    voice: String,
+    pub voice: String,
 }
 
 #[derive(Deserialize, Default, Clone)]
 pub struct InferenceConfig {
-    noise_scale: f32,
-    length_scale: f32,
-    noise_w: f32,
+    pub noise_scale: f32,
+    pub length_scale: f32,
+    pub noise_w: f32,
 }
 
 #[derive(Clone, Deserialize, Default)]
 pub struct Language {
-    code: String,
-    #[allow(dead_code)]
-    family: Option<String>,
-    #[allow(dead_code)]
-    region: Option<String>,
-    #[allow(dead_code)]
-    name_native: Option<String>,
-    #[allow(dead_code)]
-    name_english: Option<String>,
+    pub code: String,
+    pub family: Option<String>,
+    pub region: Option<String>,
+    pub name_native: Option<String>,
+    pub name_english: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -134,14 +130,14 @@ pub struct ModelConfig {
     pub audio: AudioConfig,
     pub num_speakers: u32,
     pub speaker_id_map: HashMap<String, i64>,
-    streaming: Option<bool>,
-    espeak: ESpeakConfig,
-    inference: InferenceConfig,
-    #[allow(dead_code)]
-    num_symbols: u32,
-    #[allow(dead_code)]
-    phoneme_map: HashMap<i64, char>,
-    phoneme_id_map: HashMap<char, Vec<i64>>,
+    #[serde(default)]
+    pub streaming: bool,
+    pub espeak: ESpeakConfig,
+    pub inference: InferenceConfig,
+    pub num_symbols: u32,
+    pub phoneme_map: HashMap<i64, char>,
+    pub phoneme_id_map: HashMap<char, Vec<i64>>,
+    pub dataset: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -245,12 +241,12 @@ trait VitsModelCommons {
         Ok(phonemes.into())
     }
 
-    fn get_audio_output_info(&self) -> PiperResult<AudioInfo> {
-        Ok(AudioInfo {
+    fn get_audio_output_info(&self) -> AudioInfo {
+        AudioInfo {
             sample_rate: self.get_config().audio.sample_rate as usize,
             num_channels: 1usize,
             sample_width: 2usize,
-        })
+        }
     }
 }
 
@@ -258,7 +254,7 @@ pub struct VitsModel {
     synth_config: RwLock<PiperSynthesisConfig>,
     config: ModelConfig,
     speaker_map: HashMap<i64, String>,
-    session: Session,
+    session: Mutex<Session>,
 }
 
 impl VitsModel {
@@ -274,7 +270,7 @@ impl VitsModel {
         onnx_path: &Path,
     ) -> PiperResult<Self> {
         let session = match create_inference_session(onnx_path) {
-            Ok(session) => session,
+            Ok(session) => Mutex::new(session),
             Err(err) => {
                 return Err(PiperError::OperationError(format!(
                     "Failed to initialize onnxruntime inference session: `{}`",
@@ -309,7 +305,7 @@ impl VitsModel {
             None
         };
 
-        let session = &self.session;
+        let mut session = self.session.lock().unwrap();
         let timer = std::time::Instant::now();
         let outputs = {
             let mut inputs = vec![
@@ -334,7 +330,7 @@ impl VitsModel {
         };
         let inference_ms = timer.elapsed().as_millis() as f32;
 
-        let outputs = match outputs[0].try_extract_tensor::<f32>() {
+        let outputs = match outputs[0].try_extract_array::<f32>() {
             Ok(out) => out,
             Err(e) => {
                 return Err(PiperError::OperationError(format!(
@@ -427,7 +423,7 @@ impl PiperModel for VitsModel {
     fn properties(&self) -> PiperResult<HashMap<String, String>> {
         Ok(self.get_properties())
     }
-    fn audio_output_info(&self) -> PiperResult<AudioInfo> {
+    fn audio_output_info(&self) -> AudioInfo {
         self.get_audio_output_info()
     }
 }
@@ -436,8 +432,8 @@ pub struct VitsStreamingModel {
     synth_config: RwLock<PiperSynthesisConfig>,
     config: ModelConfig,
     speaker_map: HashMap<i64, String>,
-    encoder_model: Session,
-    decoder_model: Arc<Session>,
+    encoder_model: Mutex<Session>,
+    decoder_model: Arc<Mutex<Session>>,
 }
 
 impl VitsStreamingModel {
@@ -448,7 +444,7 @@ impl VitsStreamingModel {
         decoder_path: &Path,
     ) -> PiperResult<Self> {
         let encoder_model = match create_inference_session(encoder_path) {
-            Ok(model) => model,
+            Ok(model) => Mutex::new(model),
             Err(err) => {
                 return Err(PiperError::OperationError(format!(
                     "Failed to initialize onnxruntime inference session: `{}`",
@@ -457,7 +453,7 @@ impl VitsStreamingModel {
             }
         };
         let decoder_model = match create_inference_session(decoder_path) {
-            Ok(model) => Arc::new(model),
+            Ok(model) => Arc::new(Mutex::new(model)),
             Err(err) => {
                 return Err(PiperError::OperationError(format!(
                     "Failed to initialize onnxruntime inference session: `{}`",
@@ -479,7 +475,7 @@ impl VitsStreamingModel {
     fn infer_with_values(&self, input_phonemes: Vec<i64>) -> PiperAudioResult {
         let timer = std::time::Instant::now();
         let encoder_output = self.infer_encoder(input_phonemes)?;
-        let audio = encoder_output.infer_decoder(self.decoder_model.as_ref())?;
+        let audio = encoder_output.infer_decoder(&mut *self.decoder_model.lock().unwrap())?;
         let inference_ms = timer.elapsed().as_millis() as f32;
         Ok(Audio::new(
             audio,
@@ -507,7 +503,7 @@ impl VitsStreamingModel {
             None
         };
 
-        let session = &self.encoder_model;
+        let mut session = self.encoder_model.lock().unwrap();
         {
             let mut inputs = vec![
                 SessionInputValue::from(Value::from_array(phoneme_inputs).unwrap()),
@@ -519,13 +515,16 @@ impl VitsStreamingModel {
                     Value::from_array(sid_tensor).unwrap(),
                 ));
             }
-            match session.run(SessionInputs::from(inputs.as_slice())) {
+            // appease the borrowck by binding outputs to a variable
+            // otherwise session "might outlive the function"
+            let outputs = match session.run(SessionInputs::from(inputs.as_slice())) {
                 Ok(ort_values) => EncoderOutputs::from_values(ort_values),
                 Err(e) => Err(PiperError::OperationError(format!(
                     "Failed to run model inference. Error: {}",
                     e
                 ))),
-            }
+            };
+            outputs
         }
     }
 }
@@ -599,7 +598,7 @@ impl PiperModel for VitsStreamingModel {
     fn properties(&self) -> PiperResult<HashMap<String, String>> {
         Ok(self.get_properties())
     }
-    fn audio_output_info(&self) -> PiperResult<AudioInfo> {
+    fn audio_output_info(&self) -> AudioInfo {
         self.get_audio_output_info()
     }
     fn supports_streaming_output(&self) -> bool {
@@ -636,7 +635,7 @@ impl EncoderOutputs {
     #[inline(always)]
     fn from_values(values: SessionOutputs) -> PiperResult<Self> {
         let z = {
-            let z_t = match values["z"].try_extract_tensor::<f32>() {
+            let z_t = match values["z"].try_extract_array::<f32>() {
                 Ok(out) => out,
                 Err(e) => {
                     return Err(PiperError::OperationError(format!(
@@ -648,7 +647,7 @@ impl EncoderOutputs {
             z_t.view().clone().into_owned()
         };
         let y_mask = {
-            let y_mask_t = match values["y_mask"].try_extract_tensor::<f32>() {
+            let y_mask_t = match values["y_mask"].try_extract_array::<f32>() {
                 Ok(out) => out,
                 Err(e) => {
                     return Err(PiperError::OperationError(format!(
@@ -660,7 +659,7 @@ impl EncoderOutputs {
             y_mask_t.view().clone().into_owned()
         };
         let p_duration = if values.contains_key("p_duration") {
-            let p_duration_t = match values["p_duration"].try_extract_tensor::<f32>() {
+            let p_duration_t = match values["p_duration"].try_extract_array::<f32>() {
                 Ok(out) => out,
                 Err(e) => {
                     return Err(PiperError::OperationError(format!(
@@ -674,7 +673,7 @@ impl EncoderOutputs {
             None
         };
         let g = if values.contains_key("g") {
-            let g_t = match values["g"].try_extract_tensor::<f32>() {
+            let g_t = match values["g"].try_extract_array::<f32>() {
                 Ok(out) => out,
                 Err(e) => {
                     return Err(PiperError::OperationError(format!(
@@ -694,15 +693,15 @@ impl EncoderOutputs {
             g,
         })
     }
-    fn infer_decoder(&self, session: &Session) -> PiperResult<AudioSamples> {
+    fn infer_decoder(&self, session: &mut Session) -> PiperResult<AudioSamples> {
         let outputs = {
             let mut inputs = vec![
-                SessionInputValue::from(Value::from_array(self.z.view()).unwrap()),
-                SessionInputValue::from(Value::from_array(self.y_mask.view()).unwrap()),
+                SessionInputValue::from(Value::from_array(self.z.clone()).unwrap()),
+                SessionInputValue::from(Value::from_array(self.y_mask.clone()).unwrap()),
             ];
             if !self.g.is_empty() {
                 inputs.push(SessionInputValue::from(
-                    Value::from_array(self.g.view()).unwrap(),
+                    Value::from_array(self.g.clone()).unwrap(),
                 ));
             }
             match session.run(SessionInputs::from(inputs.as_slice())) {
@@ -715,8 +714,8 @@ impl EncoderOutputs {
                 }
             }
         };
-        match outputs[0].try_extract_tensor::<f32>() {
-            Ok(out) => Ok(Vec::from(out.view().as_slice().unwrap()).into()),
+        match outputs[0].try_extract_array::<f32>() {
+            Ok(out) => Ok(Vec::from(out.as_slice().unwrap()).into()),
             Err(e) => Err(PiperError::OperationError(format!(
                 "Failed to run model inference. Error: {}",
                 e
@@ -726,7 +725,7 @@ impl EncoderOutputs {
 }
 
 struct SpeechStreamer {
-    decoder_model: Arc<Session>,
+    decoder_model: Arc<Mutex<Session>>,
     encoder_outputs: EncoderOutputs,
     mel_chunker: AdaptiveMelChunker,
     one_shot: bool,
@@ -734,7 +733,7 @@ struct SpeechStreamer {
 
 impl SpeechStreamer {
     fn new(
-        decoder_model: Arc<Session>,
+        decoder_model: Arc<Mutex<Session>>,
         encoder_outputs: EncoderOutputs,
         chunk_size: usize,
         chunk_padding: usize,
@@ -760,18 +759,19 @@ impl SpeechStreamer {
     ) -> PiperResult<AudioSamples> {
         // println!("Mel index: {:?}\nAudio Index: {:?}", mel_index, audio_index);
         let audio = {
-            let session = Arc::clone(&self.decoder_model);
+            let decoder_model = Arc::clone(&self.decoder_model);
+            let mut session = decoder_model.lock().unwrap();
             let z_view = self.encoder_outputs.z.view();
             let y_mask_view = self.encoder_outputs.y_mask.view();
             let z_chunk = z_view.slice_axis(Axis(2), mel_index);
             let y_mask_chunk = y_mask_view.slice_axis(Axis(2), mel_index);
             let mut inputs = vec![
-                SessionInputValue::from(Value::from_array(z_chunk).unwrap()),
-                SessionInputValue::from(Value::from_array(y_mask_chunk).unwrap()),
+                SessionInputValue::from(Value::from_array(z_chunk.to_owned()).unwrap()),
+                SessionInputValue::from(Value::from_array(y_mask_chunk.to_owned()).unwrap()),
             ];
             if !self.encoder_outputs.g.is_empty() {
                 inputs.push(SessionInputValue::from(
-                    Value::from_array(self.encoder_outputs.g.view()).unwrap(),
+                    Value::from_array(self.encoder_outputs.g.to_owned()).unwrap(),
                 ));
             }
             let outputs = session
@@ -782,7 +782,7 @@ impl SpeechStreamer {
                         e
                     ))
                 })?;
-            let audio_t = outputs[0].try_extract_tensor::<f32>().map_err(|e| {
+            let audio_t = outputs[0].try_extract_array::<f32>().map_err(|e| {
                 PiperError::OperationError(format!("Failed to run model inference. Error: {}", e))
             })?;
             self.process_chunk_audio(audio_t.view().view(), audio_index)?
@@ -815,7 +815,7 @@ impl Iterator for SpeechStreamer {
             self.mel_chunker.consume();
             Some(
                 self.encoder_outputs
-                    .infer_decoder(self.decoder_model.as_ref()),
+                    .infer_decoder(&mut *self.decoder_model.lock().unwrap()),
             )
         } else {
             Some(self.synthesize_chunk(mel_index, audio_index))
